@@ -86,7 +86,12 @@ async function start() {
   try {
     // FIX: connect Redis BEFORE accepting any calls
     logger.info('Connecting to Redis...');
-    await connectRedis();
+    try {
+  await connectRedis();
+  logger.info('Redis connected');
+} catch (err) {
+  logger.warn('Redis not available — continuing without it');
+}
 
     server.listen(PORT, '0.0.0.0', async () => {
       logger.info(`✅ SNEHAMVERSE Voice Agent v2.1 running on port ${PORT}`);
