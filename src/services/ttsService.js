@@ -1,7 +1,6 @@
 // src/services/ttsService.js
-// ElevenLabs Turbo v2.5 — primary TTS
-// FIX: Twilio fallback TTS when ElevenLabs fails/blocked (free tier VPN detection)
-// FIX: returns special fallback object so streamHandler can use Twilio <Say>
+// ElevenLabs eleven_multilingual_v2 — human-quality Telugu, Hindi, English
+// Fallback: Twilio <Say> if ElevenLabs fails or is unavailable
 
 const logger = require('../utils/logger');
 
@@ -9,38 +8,69 @@ const audioCache = new Map();
 const MAX_CACHE  = 50;
 const LANG_CODE  = { english: 'en', hindi: 'hi', telugu: 'te' };
 
-// ── Primary: ElevenLabs ───────────────────────────────────────
+// ── Primary: ElevenLabs multilingual v2 ──────────────────────
 async function textToSpeechElevenLabs(text, language) {
   const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-  const body    = {
+
+  const body = {
     text,
-    model_id: 'eleven_turbo_v2_5',
-    voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.20, use_speaker_boost: true },
+    model_id: 'eleven_multilingual_v2',        // ✅ human-quality for Telugu & Hindi
+    voice_settings: {
+      stability:        0.45,                  // slightly lower = more natural variation
+      similarity_boost: 0.90,
+      style:            0.35,                  // adds expressiveness — sounds less robotic
+      use_speaker_boost: true,
+    },
   };
+
   const langCode = LANG_CODE[language];
   if (langCode && langCode !== 'en') body.language_code = langCode;
 
-  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-    method:  'POST',
-    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-    body:    JSON.stringify(body),
-  });
+  // ── 3 second timeout — fail fast to fallback ──────────────
+  const controller = new AbortController();
+  const timeout    = setTimeout(() => controller.abort(), 3000);
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`ElevenLabs ${response.status}: ${err}`);
+  try {
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        method:  'POST',
+        headers: {
+          'xi-api-key':   process.env.ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept':       'audio/mpeg',
+        },
+        body:   JSON.stringify(body),
+        signal: controller.signal,
+      }
+    );
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`ElevenLabs ${response.status}: ${err}`);
+    }
+
+    return Buffer.from(await response.arrayBuffer());
+
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
   }
-
-  return Buffer.from(await response.arrayBuffer());
 }
 
-// ── Fallback: signals streamHandler to use Twilio's built-in <Say> ───
+// ── Fallback: Twilio built-in <Say> via TwiML ─────────────────
+// Note: Polly.Aditi is Hindi — no native Telugu Polly voice exists.
+// For Telugu callers ElevenLabs multilingual_v2 is essential.
 function makeTwilioFallback(text, language) {
   return {
     isFallback: true,
     text,
     voice:    'Polly.Aditi',
-    langCode: language === 'hindi' ? 'hi-IN' : language === 'telugu' ? 'te-IN' : 'en-IN',
+    langCode: language === 'hindi'  ? 'hi-IN'
+            : language === 'telugu' ? 'te-IN'
+            : 'en-IN',
   };
 }
 
@@ -57,16 +87,19 @@ async function textToSpeech(text, language = 'english') {
   if (process.env.ELEVENLABS_API_KEY) {
     try {
       const buf = await textToSpeechElevenLabs(text, language);
-      if (audioCache.size >= MAX_CACHE) audioCache.delete(audioCache.keys().next().value);
+      if (audioCache.size >= MAX_CACHE) {
+        audioCache.delete(audioCache.keys().next().value);
+      }
       audioCache.set(cacheKey, buf);
-      logger.debug('TTS via ElevenLabs', { language, chars: text.length });
+      logger.debug('TTS via ElevenLabs multilingual_v2', { language, chars: text.length });
       return buf;
     } catch (err) {
-      logger.warn('ElevenLabs unavailable — switching to Twilio TTS fallback', { error: err.message });
+      logger.warn('ElevenLabs unavailable — switching to Twilio TTS fallback', {
+        error: err.message,
+      });
     }
   }
 
-  // Return fallback marker — streamHandler handles it via TwiML REST call
   return makeTwilioFallback(text, language);
 }
 
