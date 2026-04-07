@@ -18,6 +18,7 @@ const { connectRedis }       = require('./services/sessionManager');
 const logger = require('./utils/logger');
 
 const app    = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ── Security ──────────────────────────────────────────────────
@@ -79,7 +80,7 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start — Redis first, then server ─────────────────────────
-const PORT = parseInt(process.env.PORT) || 3000;
+const PORT = (process.env.PORT) || 3000;
 
 async function start() {
   try {
@@ -87,7 +88,7 @@ async function start() {
     logger.info('Connecting to Redis...');
     await connectRedis();
 
-    server.listen(PORT, async () => {
+    server.listen(PORT, '0.0.0.0', async () => {
       logger.info(`✅ SNEHAMVERSE Voice Agent v2.1 running on port ${PORT}`);
       logger.info(`   Business : ${process.env.BUSINESS_NAME}`);
       logger.info(`   Type     : ${process.env.BUSINESS_TYPE}`);
