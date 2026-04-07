@@ -1,10 +1,9 @@
 // src/handlers/streamHandler.js
 // Core pipeline: Twilio Audio → Deepgram STT → Claude → ElevenLabs/Twilio TTS → Caller
-// FIX: sessionEnded guard prevents double WhatsApp / double Sheets logging
-// FIX: Deepgram send wrapped in try/catch
-// FIX: null session guard — waits for Redis before processing
-// FIX: handles TTS fallback object (uses Twilio REST <Say> when ElevenLabs blocked)
-// FIX: call timeout + idle timeout
+// FIX: stale session bug — re-fetch session after LLM call so language is always current
+// FIX: <Hangup> sent via Twilio REST on call end — caller no longer hears dead silence
+// FIX: double processing race — clearTimeout(silenceTimer) in UtteranceEnd handler
+// FIX: booking check supports both clinic (name) and snehamverse (institution)
 
 const WebSocket = require('ws');
 const twilio    = require('twilio');
@@ -28,7 +27,6 @@ const DEBOUNCE_MS      = 800;
 
 const activeConnections = new Map();
 
-// Twilio REST client for fallback TTS + transfer
 const twilioRest = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 function setupStreamHandler(wss) {
@@ -41,7 +39,7 @@ function setupStreamHandler(wss) {
     let isProcessing     = false;
     let transcriptBuffer = '';
     let streamSid        = null;
-    let sessionEnded     = false;  // Guard against double call-end processing
+    let sessionEnded     = false;
     let silenceTimer     = null;
     let idleTimer        = null;
     let maxCallTimer     = null;
@@ -76,6 +74,7 @@ function setupStreamHandler(wss) {
           if (isFinal) {
             transcriptBuffer += ' ' + transcript;
 
+            // Update language in Redis whenever Deepgram detects it
             if (detectedLang && callSid) {
               const detectedKey = detectLanguage(detectedLang, transcript);
               const session     = await sessionManager.getSession(callSid);
@@ -94,9 +93,10 @@ function setupStreamHandler(wss) {
           }
         });
 
+        // FIX: clear silenceTimer before processing to prevent double-processing race
         dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
           if (transcriptBuffer.trim().length > 0 && !isProcessing) {
-            clearTimeout(silenceTimer);
+            clearTimeout(silenceTimer); // ← prevents both handlers firing for same utterance
             const final = transcriptBuffer.trim();
             transcriptBuffer = '';
             await processUserInput(final);
@@ -142,7 +142,6 @@ function setupStreamHandler(wss) {
       isProcessing = true;
       try {
         const session = await sessionManager.getSession(callSid);
-        // FIX: guard against null session (Redis not ready yet)
         if (!session) {
           logger.warn('Session not found — Redis may still be connecting', { callSid });
           isProcessing = false;
@@ -157,16 +156,21 @@ function setupStreamHandler(wss) {
           await sessionManager.updateSession(callSid, {
             bookingData: { ...(session.bookingData || {}), ...aiResult.bookingData }
           });
-          logger.info('Booking data captured', { callSid });
+          logger.info('Booking data captured', { callSid, data: aiResult.bookingData });
         }
 
+        // FIX: re-fetch session AFTER LLM call so we get the latest language from Redis
+        // (Deepgram may have updated it while LLM was processing)
+        const freshSession = await sessionManager.getSession(callSid);
+        const currentLanguage = freshSession?.language || session.language;
+
         if (aiResult.transfer && process.env.ENABLE_HUMAN_TRANSFER === 'true') {
-          await speakToUser(aiResult.text, session.language);
+          await speakToUser(aiResult.text, currentLanguage);
           await handleTransfer();
           return;
         }
 
-        await speakToUser(aiResult.text, session.language);
+        await speakToUser(aiResult.text, currentLanguage);
 
       } catch (err) {
         logger.error('processUserInput error', { error: err.message, callSid });
@@ -176,15 +180,12 @@ function setupStreamHandler(wss) {
     }
 
     // ── TTS → send audio to caller ────────────────────────────
-    // FIX: handles both Buffer (ElevenLabs) and fallback object (Twilio <Say>)
     async function speakToUser(text, language = 'english') {
       if (!text || !streamSid || sessionEnded) return;
       try {
         const result = await textToSpeech(text, language);
         if (!result) return;
 
-        // FIX: if ElevenLabs was blocked, result is { isFallback, text, voice, langCode }
-        // Use Twilio REST API to inject <Say> TwiML into the live call
         if (result.isFallback) {
           logger.info('Using Twilio <Say> fallback TTS', { callSid });
           try {
@@ -197,7 +198,6 @@ function setupStreamHandler(wss) {
           return;
         }
 
-        // Normal path: ElevenLabs audio buffer → send as media stream
         if (ws.readyState !== WebSocket.OPEN) return;
         ws.send(JSON.stringify({
           event:    'media',
@@ -226,7 +226,8 @@ function setupStreamHandler(wss) {
       }
     }
 
-    // ── Call end — sessionEnded guard prevents double-fire ────
+    // ── Call end ──────────────────────────────────────────────
+    // FIX: sends <Hangup> via Twilio REST so caller doesn't hear dead silence
     async function handleCallEnd(reason = 'completed') {
       if (sessionEnded) return;
       sessionEnded = true;
@@ -236,14 +237,28 @@ function setupStreamHandler(wss) {
 
       logger.info('Call ended', { callSid, reason });
 
+      // FIX: hang up via Twilio REST — stops the 2-minute TwiML pause buffer
+      try {
+        await twilioRest.calls(callSid).update({
+          twiml: `<Response><Hangup/></Response>`
+        });
+        logger.info('Hangup sent to Twilio', { callSid });
+      } catch (err) {
+        // Call may have already ended naturally — not a critical error
+        logger.warn('Hangup REST call failed (call may already be ended)', { error: err.message });
+      }
+
       try {
         const finalSession = await sessionManager.endSession(callSid, reason);
         if (!finalSession) return;
 
         const summary = await generateCallSummary(finalSession);
 
+        // FIX: check both .name (clinic) and .institution (snehamverse) for booking confirmation
+        const hasBooking = finalSession.bookingData?.name || finalSession.bookingData?.institution;
+
         await Promise.allSettled([
-          finalSession.bookingData?.name
+          hasBooking
             ? sendBookingConfirmation(callerPhone, finalSession.bookingData, finalSession.language)
             : Promise.resolve(),
           sendOwnerSummary(finalSession, summary),
@@ -280,7 +295,6 @@ function setupStreamHandler(wss) {
 
             activeConnections.set(callSid, ws);
 
-            // FIX: create session here synchronously, then greet
             try {
               await sessionManager.createSession(callSid, callerPhone);
             } catch (err) {
@@ -292,11 +306,16 @@ function setupStreamHandler(wss) {
               if (sessionEnded) return;
               logger.warn('Max call duration reached', { callSid });
               const session = await sessionManager.getSession(callSid);
-              if (session) await speakToUser(getLanguageConfig(session.language).timeoutMessage, session.language);
+              if (session) {
+                await speakToUser(
+                  getLanguageConfig(session.language).timeoutMessage,
+                  session.language
+                );
+              }
               setTimeout(() => handleCallEnd('max_duration'), 3000);
             }, MAX_CALL_SECONDS * 1000);
 
-            // Greet caller
+            // Greet caller — 1200ms delay lets audio stream stabilize first
             setTimeout(async () => {
               try {
                 const session    = await sessionManager.getSession(callSid);
@@ -304,7 +323,8 @@ function setupStreamHandler(wss) {
                 const greeting   = langConfig.greeting();
                 await speakToUser(greeting, session?.language || 'english');
                 await sessionManager.addMessage(callSid, 'assistant', greeting);
-                resetIdleTimer();
+                // 500ms gap after greeting before idle timer activates
+                setTimeout(() => resetIdleTimer(), 500);
               } catch (err) {
                 logger.error('Greeting error', { error: err.message, callSid });
               }

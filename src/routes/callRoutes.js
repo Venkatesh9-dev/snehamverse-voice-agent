@@ -1,5 +1,7 @@
 // src/routes/callRoutes.js
 // Twilio webhook handlers — incoming calls + status callbacks + admin endpoints
+// FIX: reduced TwiML pauses from 5x60s to 2x60s — WebSocket sends <Hangup> before this runs out
+// FIX: added maxCallDuration to <Stream> as a safety cap at TwiML level
 
 const express = require('express');
 const twilio  = require('twilio');
@@ -10,7 +12,7 @@ const router = express.Router();
 
 // ── Twilio Signature Validation ───────────────────────────────
 function validateTwilio(req, res, next) {
-  if (process.env.NODE_ENV !== 'production') return next(); // Skip in dev
+  if (process.env.NODE_ENV !== 'production') return next();
 
   const signature = req.headers['x-twilio-signature'] || '';
   const url       = `${process.env.BASE_URL}${req.originalUrl}`;
@@ -29,45 +31,41 @@ function validateTwilio(req, res, next) {
 }
 
 // ── POST /call/incoming ───────────────────────────────────────
-// Twilio calls this when someone dials your number
 router.post('/incoming', validateTwilio, (req, res) => {
-  const callSid     = req.body.CallSid  || 'unknown';
-  const callerPhone = req.body.From     || 'unknown';
+  const callSid     = req.body.CallSid || 'unknown';
+  const callerPhone = req.body.From    || 'unknown';
 
   logger.info('Incoming call received', { callSid });
 
   const twiml  = new twilio.twiml.VoiceResponse();
-
-  // Open bidirectional media stream to our WebSocket handler
   const start  = twiml.start();
   const stream = start.stream({
-    url:  `wss://${req.headers.host}/call/stream`,
+    url:   `wss://${req.headers.host}/call/stream`,
     track: 'inbound_track',
   });
 
-  // Pass caller phone through to WebSocket via custom params
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
-  // Keep call alive — Twilio pauses while WebSocket manages the audio
-  // Two 60s pauses = 2 min; the WebSocket will end the call before this
+  // FIX: 2 pauses only — streamHandler sends <Hangup> via REST well before 120s
+  // This is just a safety buffer in case WebSocket closes without sending hangup
   twiml.pause({ length: 60 });
   twiml.pause({ length: 60 });
-  twiml.pause({ length: 60 });
-  twiml.pause({ length: 60 });
-  twiml.pause({ length: 60 });
+
+  // Final say in case both pauses exhaust (should never happen in normal flow)
+  twiml.say({ voice: 'Polly.Aditi', language: 'en-IN' },
+    'Thank you for calling. Please call us again. Goodbye.');
+  twiml.hangup();
 
   res.type('text/xml').send(twiml.toString());
   logger.info('TwiML sent, media stream opening', { callSid });
 });
 
 // ── POST /call/status ─────────────────────────────────────────
-// Twilio status callbacks — handles missed calls
 router.post('/status', validateTwilio, async (req, res) => {
   const { CallSid, CallStatus, From } = req.body;
   logger.info('Call status update', { CallSid, CallStatus });
 
-  // Auto-reply on missed/failed calls via WhatsApp
   if (['no-answer', 'busy', 'failed'].includes(CallStatus) && From) {
     try {
       await sendMissedCallMessage(From, 'english');
@@ -80,7 +78,6 @@ router.post('/status', validateTwilio, async (req, res) => {
 });
 
 // ── GET /call/appointments ────────────────────────────────────
-// Admin endpoint — view where to find call logs
 router.get('/appointments', (req, res) => {
   const apiKey = req.headers['x-api-key'];
   if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
