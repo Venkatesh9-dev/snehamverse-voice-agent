@@ -52,8 +52,8 @@ function checkEnv() {
     process.exit(1);
   }
 
-  // Validate BUSINESS_TYPE
-  const validTypes = ['clinic', 'coaching', 'realestate', 'college'];
+  // Validate BUSINESS_TYPE — snehamverse added
+  const validTypes = ['clinic', 'coaching', 'realestate', 'college', 'snehamverse'];
   if (!validTypes.includes(process.env.BUSINESS_TYPE)) {
     console.error(`\n❌ BUSINESS_TYPE must be one of: ${validTypes.join(', ')}\n`);
     process.exit(1);
