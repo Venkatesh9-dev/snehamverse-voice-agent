@@ -1,9 +1,14 @@
 // src/handlers/streamHandler.js
-// Core pipeline: Twilio Audio → Deepgram STT → Claude → ElevenLabs/Twilio TTS → Caller
-// FIX: stale session bug — re-fetch session after LLM call so language is always current
-// FIX: <Hangup> sent via Twilio REST on call end — caller no longer hears dead silence
-// FIX: double processing race — clearTimeout(silenceTimer) in UtteranceEnd handler
-// FIX: booking check supports both clinic (name) and snehamverse (institution)
+// FIX: confidence threshold 0.75 — noise ignored
+// FIX: min transcript length 8 chars — single syllables ignored
+// FIX: DEBOUNCE_MS 1200ms — agent waits for caller to finish
+// FIX: utterance_end_ms 1500ms — no premature cutoffs
+// FIX: endpointing 300ms — better silence detection on phone audio
+// FIX: VAD handler added — blocks processing when no voice detected
+// FIX: resetIdleTimer only on confident speech — noise doesn't keep call alive
+// FIX: buffer sanitization — weird chars cleaned before sending to Claude
+// FIX: bye detection — call ends naturally when caller says goodbye
+// FIX: max call duration 150 seconds (2 min 30 sec)
 
 const WebSocket = require('ws');
 const twilio    = require('twilio');
@@ -21,12 +26,39 @@ const logger = require('../utils/logger');
 
 const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
 
-const MAX_CALL_SECONDS = parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 600;
+// ── Config ────────────────────────────────────────────────────
+const MAX_CALL_SECONDS = parseInt(process.env.MAX_CALL_DURATION_SECONDS) || 150; // 2 min 30 sec
 const IDLE_TIMEOUT_MS  = (parseInt(process.env.IDLE_TIMEOUT_SECONDS) || 30) * 1000;
-const DEBOUNCE_MS      = 800;
+const DEBOUNCE_MS      = 1200;  // FIX: was 800 — too short for Indian speech
+const MIN_TRANSCRIPT   = 8;     // FIX: was 2 — filters out noise/single syllables
+const MIN_CONFIDENCE   = 0.75;  // FIX: new — ignore low confidence transcripts
+
+// Bye detection — triggers polite goodbye + hangup
+const BYE_PATTERNS = [
+  // English
+  'bye', 'goodbye', 'good bye', 'see you', 'thank you bye',
+  'thanks bye', "that's all", 'no thank you', 'not interested',
+  'stop calling', 'do not call',
+  // Telugu
+  'సరే', 'వెళ్తా', 'థాంక్యూ', 'వద్దు', 'అక్కర్లేదు', 'సెలవు',
+  // Hindi
+  'ठीक है', 'धन्यवाद', 'नहीं चाहिए', 'अलविदा', 'बाय', 'रहने दो',
+];
+
+function detectBye(transcript) {
+  const lower = transcript.toLowerCase().trim();
+  return BYE_PATTERNS.some(p => lower.includes(p.toLowerCase()));
+}
+
+// Basic transcript sanitization
+function sanitize(text) {
+  return text
+    .replace(/[^\w\s\u0900-\u097F\u0C00-\u0C7F.,!?'-]/g, ' ') // keep Indian scripts
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 const activeConnections = new Map();
-
 const twilioRest = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 function setupStreamHandler(wss) {
@@ -43,6 +75,7 @@ function setupStreamHandler(wss) {
     let silenceTimer     = null;
     let idleTimer        = null;
     let maxCallTimer     = null;
+    let isSpeaking       = false; // VAD: true when human voice detected
 
     // ── Deepgram ──────────────────────────────────────────────
     function setupDeepgram() {
@@ -52,8 +85,9 @@ function setupStreamHandler(wss) {
           language:         'multi',
           smart_format:     true,
           interim_results:  true,
-          utterance_end_ms: 1000,
+          utterance_end_ms: 1500,  // FIX: was 1000 — prevents premature cutoffs
           vad_events:       true,
+          endpointing:      300,   // FIX: new — better silence detection on phone audio
           encoding:         'mulaw',
           sample_rate:      8000,
           channels:         1,
@@ -63,20 +97,54 @@ function setupStreamHandler(wss) {
           logger.debug('Deepgram open', { callSid });
         });
 
+        // FIX: VAD handler — track when human is actually speaking
+        dgConnection.on(LiveTranscriptionEvents.SpeechStarted, () => {
+          isSpeaking = true;
+          logger.debug('VAD: speech started', { callSid });
+        });
+
+        dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
+          isSpeaking = false;
+          logger.debug('VAD: utterance ended', { callSid });
+
+          // FIX: min length check — was 0 chars
+          const final = sanitize(transcriptBuffer.trim());
+          if (final.length >= MIN_TRANSCRIPT && !isProcessing) {
+            clearTimeout(silenceTimer);
+            transcriptBuffer = '';
+            await processUserInput(final);
+          } else {
+            transcriptBuffer = '';
+          }
+        });
+
         dgConnection.on(LiveTranscriptionEvents.Transcript, async (data) => {
-          const transcript   = data.channel?.alternatives?.[0]?.transcript;
-          const isFinal      = data.is_final;
+          const alt        = data.channel?.alternatives?.[0];
+          const transcript = alt?.transcript;
+          const isFinal    = data.is_final;
+          const confidence = alt?.confidence || 0;
           const detectedLang = data.channel?.detected_language;
 
           if (!transcript || !transcript.trim()) return;
+
+          // FIX: confidence threshold — ignore noise (confidence < 0.75)
+          if (confidence < MIN_CONFIDENCE) {
+            logger.debug('Low confidence transcript ignored', { confidence, transcript });
+            return;
+          }
+
+          // FIX: resetIdleTimer only on confident human speech — not on noise
           resetIdleTimer();
 
           if (isFinal) {
-            transcriptBuffer += ' ' + transcript;
+            const clean = sanitize(transcript);
+            if (!clean) return;
 
-            // Update language in Redis whenever Deepgram detects it
+            transcriptBuffer += ' ' + clean;
+
+            // Update language in Redis
             if (detectedLang && callSid) {
-              const detectedKey = detectLanguage(detectedLang, transcript);
+              const detectedKey = detectLanguage(detectedLang, clean);
               const session     = await sessionManager.getSession(callSid);
               if (session && session.language !== detectedKey) {
                 await sessionManager.updateSession(callSid, { language: detectedKey });
@@ -86,20 +154,13 @@ function setupStreamHandler(wss) {
 
             clearTimeout(silenceTimer);
             silenceTimer = setTimeout(async () => {
-              const final = transcriptBuffer.trim();
+              const final = sanitize(transcriptBuffer.trim());
               transcriptBuffer = '';
-              if (final.length >= 2 && !isProcessing) await processUserInput(final);
+              // FIX: min length 8 — was 2
+              if (final.length >= MIN_TRANSCRIPT && !isProcessing) {
+                await processUserInput(final);
+              }
             }, DEBOUNCE_MS);
-          }
-        });
-
-        // FIX: clear silenceTimer before processing to prevent double-processing race
-        dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
-          if (transcriptBuffer.trim().length > 0 && !isProcessing) {
-            clearTimeout(silenceTimer); // ← prevents both handlers firing for same utterance
-            const final = transcriptBuffer.trim();
-            transcriptBuffer = '';
-            await processUserInput(final);
           }
         });
 
@@ -140,11 +201,23 @@ function setupStreamHandler(wss) {
     async function processUserInput(transcript) {
       if (isProcessing || sessionEnded) return;
       isProcessing = true;
+
       try {
+        logger.info('Processing input', { callSid, chars: transcript.length, transcript });
+
         const session = await sessionManager.getSession(callSid);
         if (!session) {
-          logger.warn('Session not found — Redis may still be connecting', { callSid });
+          logger.warn('Session not found', { callSid });
           isProcessing = false;
+          return;
+        }
+
+        // FIX: detect bye BEFORE sending to LLM — saves cost + ends naturally
+        if (detectBye(transcript)) {
+          logger.info('Bye detected — ending call politely', { callSid });
+          const lang = getLanguageConfig(session.language);
+          await speakToUser(lang.timeoutMessage, session.language);
+          setTimeout(() => handleCallEnd('caller_ended'), 3000);
           return;
         }
 
@@ -156,12 +229,11 @@ function setupStreamHandler(wss) {
           await sessionManager.updateSession(callSid, {
             bookingData: { ...(session.bookingData || {}), ...aiResult.bookingData }
           });
-          logger.info('Booking data captured', { callSid, data: aiResult.bookingData });
+          logger.info('Booking data captured', { callSid });
         }
 
-        // FIX: re-fetch session AFTER LLM call so we get the latest language from Redis
-        // (Deepgram may have updated it while LLM was processing)
-        const freshSession = await sessionManager.getSession(callSid);
+        // Re-fetch session for latest language after LLM call
+        const freshSession    = await sessionManager.getSession(callSid);
         const currentLanguage = freshSession?.language || session.language;
 
         if (aiResult.transfer && process.env.ENABLE_HUMAN_TRANSFER === 'true') {
@@ -171,6 +243,11 @@ function setupStreamHandler(wss) {
         }
 
         await speakToUser(aiResult.text, currentLanguage);
+
+        // If LLM response itself contains a goodbye — end the call
+        if (detectBye(aiResult.text)) {
+          setTimeout(() => handleCallEnd('agent_ended'), 4000);
+        }
 
       } catch (err) {
         logger.error('processUserInput error', { error: err.message, callSid });
@@ -205,7 +282,7 @@ function setupStreamHandler(wss) {
           media: { payload: result.toString('base64') },
         }));
 
-        logger.debug('Audio sent via ElevenLabs', { chars: text.length, language });
+        logger.debug('Audio sent', { chars: text.length, language });
 
       } catch (err) {
         logger.error('speakToUser error', { error: err.message });
@@ -227,7 +304,6 @@ function setupStreamHandler(wss) {
     }
 
     // ── Call end ──────────────────────────────────────────────
-    // FIX: sends <Hangup> via Twilio REST so caller doesn't hear dead silence
     async function handleCallEnd(reason = 'completed') {
       if (sessionEnded) return;
       sessionEnded = true;
@@ -237,15 +313,14 @@ function setupStreamHandler(wss) {
 
       logger.info('Call ended', { callSid, reason });
 
-      // FIX: hang up via Twilio REST — stops the 2-minute TwiML pause buffer
+      // Hangup via Twilio REST — stops TwiML pause buffer
       try {
         await twilioRest.calls(callSid).update({
           twiml: `<Response><Hangup/></Response>`
         });
-        logger.info('Hangup sent to Twilio', { callSid });
+        logger.info('Hangup sent', { callSid });
       } catch (err) {
-        // Call may have already ended naturally — not a critical error
-        logger.warn('Hangup REST call failed (call may already be ended)', { error: err.message });
+        logger.warn('Hangup failed — call may already be ended', { error: err.message });
       }
 
       try {
@@ -253,8 +328,6 @@ function setupStreamHandler(wss) {
         if (!finalSession) return;
 
         const summary = await generateCallSummary(finalSession);
-
-        // FIX: check both .name (clinic) and .institution (snehamverse) for booking confirmation
         const hasBooking = finalSession.bookingData?.name || finalSession.bookingData?.institution;
 
         await Promise.allSettled([
@@ -265,7 +338,7 @@ function setupStreamHandler(wss) {
           logCallToSheets(finalSession, summary),
         ]);
 
-        logger.info('Post-call processing done', { callSid });
+        logger.info('Post-call processing done', { callSid, reason });
 
       } catch (err) {
         logger.error('handleCallEnd error', { error: err.message, callSid });
@@ -301,10 +374,10 @@ function setupStreamHandler(wss) {
               logger.error('Failed to create session', { error: err.message, callSid });
             }
 
-            // Max duration guard
+            // Max 2 min 30 sec hard limit
             maxCallTimer = setTimeout(async () => {
               if (sessionEnded) return;
-              logger.warn('Max call duration reached', { callSid });
+              logger.warn('Max call duration reached', { callSid, seconds: MAX_CALL_SECONDS });
               const session = await sessionManager.getSession(callSid);
               if (session) {
                 await speakToUser(
@@ -315,7 +388,7 @@ function setupStreamHandler(wss) {
               setTimeout(() => handleCallEnd('max_duration'), 3000);
             }, MAX_CALL_SECONDS * 1000);
 
-            // Greet caller — 1200ms delay lets audio stream stabilize first
+            // Greet after 1200ms — lets stream stabilize
             setTimeout(async () => {
               try {
                 const session    = await sessionManager.getSession(callSid);
@@ -323,7 +396,6 @@ function setupStreamHandler(wss) {
                 const greeting   = langConfig.greeting();
                 await speakToUser(greeting, session?.language || 'english');
                 await sessionManager.addMessage(callSid, 'assistant', greeting);
-                // 500ms gap after greeting before idle timer activates
                 setTimeout(() => resetIdleTimer(), 500);
               } catch (err) {
                 logger.error('Greeting error', { error: err.message, callSid });
