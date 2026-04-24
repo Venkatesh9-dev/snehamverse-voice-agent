@@ -1,5 +1,9 @@
 // src/index.js
 // SNEHAMVERSE Voice Agent v2.1 — Production Server
+// FIX CRITICAL: removed verifyClient block — was rejecting Twilio WebSocket connections
+//               Railway's proxy strips/modifies user-agent before it reaches the server
+//               so TwilioProxy check always failed in production = WebSocket rejected = silence
+//               Security is handled by X-Twilio-Signature on HTTP webhooks instead
 // FIX: Redis pre-connected before server accepts calls
 
 require('dotenv').config();
@@ -35,20 +39,15 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── WebSocket for Twilio Media Streams ────────────────────────
+// FIX CRITICAL: verifyClient removed entirely
+// It was checking user-agent for 'TwilioProxy' but Railway's load balancer
+// strips/rewrites headers — so the check always failed in production
+// and every Twilio WebSocket connection was rejected with 403 Forbidden
+// Result: agent picks up call but streams no audio = caller hears silence
+// Security: X-Twilio-Signature validation on HTTP webhooks handles auth instead
 const wss = new WebSocket.Server({
   server,
   path: '/call/stream',
-  verifyClient: ({ req }, cb) => {
-    if (process.env.NODE_ENV === 'production') {
-      const ua = req.headers['user-agent'] || '';
-      if (!ua.includes('TwilioProxy') && !ua.includes('twilio')) {
-        logger.warn('Rejected non-Twilio WebSocket', { ua });
-        cb(false, 403, 'Forbidden');
-        return;
-      }
-    }
-    cb(true);
-  }
 });
 
 setupStreamHandler(wss);
@@ -80,18 +79,17 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start — Redis first, then server ─────────────────────────
-const PORT = (process.env.PORT) || 3000;
+const PORT = parseInt(process.env.PORT) || 3000;
 
 async function start() {
   try {
-    // FIX: connect Redis BEFORE accepting any calls
     logger.info('Connecting to Redis...');
     try {
-  await connectRedis();
-  logger.info('Redis connected');
-} catch (err) {
-  logger.warn('Redis not available — continuing without it');
-}
+      await connectRedis();
+      logger.info('Redis connected');
+    } catch (err) {
+      logger.warn('Redis not available — continuing without it');
+    }
 
     server.listen(PORT, '0.0.0.0', async () => {
       logger.info(`✅ SNEHAMVERSE Voice Agent v2.1 running on port ${PORT}`);
@@ -99,7 +97,6 @@ async function start() {
       logger.info(`   Type     : ${process.env.BUSINESS_TYPE}`);
       logger.info(`   Webhook  : ${process.env.BASE_URL}/call/incoming`);
 
-      // Google Sheets headers — non-blocking, failure is OK
       try {
         await initSheetsHeaders();
       } catch {
@@ -115,7 +112,6 @@ async function start() {
 
 start();
 
-// ── Graceful shutdown ─────────────────────────────────────────
 process.on('SIGTERM', () => {
   logger.info('SIGTERM — shutting down');
   server.close(() => { logger.info('Server closed'); process.exit(0); });
