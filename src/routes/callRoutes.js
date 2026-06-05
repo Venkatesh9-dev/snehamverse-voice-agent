@@ -1,7 +1,9 @@
 // src/routes/callRoutes.js
-// Twilio webhook handlers — incoming calls + status callbacks + admin endpoints
-// FIX: reduced TwiML pauses from 5x60s to 2x60s — WebSocket sends <Hangup> before this runs out
-// FIX: added maxCallDuration to <Stream> as a safety cap at TwiML level
+// SNEHAMVERSE Voice Agent
+//
+// Audio delivery: bidirectional WebSocket media events (both_tracks)
+// Uses <Connect><Stream> — required for sending audio back to caller
+// <Start><Stream> is receive-only (monitoring) — DO NOT use for voice agents
 
 const express = require('express');
 const twilio  = require('twilio');
@@ -37,25 +39,15 @@ router.post('/incoming', validateTwilio, (req, res) => {
 
   logger.info('Incoming call received', { callSid });
 
-  const twiml  = new twilio.twiml.VoiceResponse();
-  const start  = twiml.start();
-  const stream = start.stream({
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const connect = twiml.connect();
+  const stream  = connect.stream({
     url:   `wss://${req.headers.host}/call/stream`,
-    track: 'inbound_track',
+    track: 'both_tracks',
   });
 
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
-
-  // FIX: 2 pauses only — streamHandler sends <Hangup> via REST well before 120s
-  // This is just a safety buffer in case WebSocket closes without sending hangup
-  twiml.pause({ length: 60 });
-  twiml.pause({ length: 60 });
-
-  // Final say in case both pauses exhaust (should never happen in normal flow)
-  twiml.say({ voice: 'Polly.Aditi', language: 'en-IN' },
-    'Thank you for calling. Please call us again. Goodbye.');
-  twiml.hangup();
 
   res.type('text/xml').send(twiml.toString());
   logger.info('TwiML sent, media stream opening', { callSid });
