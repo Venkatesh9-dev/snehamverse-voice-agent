@@ -1,9 +1,14 @@
 // src/services/ttsService.js — SNEHAMVERSE Voice Agent
-// FIX CRITICAL: output_format=ulaw_8000 in request BODY
-// FIX CRITICAL: Accept header changed to audio/basic (mulaw)
-// FIX: eleven_turbo_v2_5 — supports ulaw_8000, faster, cheaper
+//
+// FIX CRITICAL: output_format=ulaw_8000 in request BODY (URL query param silently ignored)
+// FIX CRITICAL: Accept header = audio/basic (mulaw MIME type, not audio/mpeg)
+// FIX: eleven_turbo_v2_5 — supports ulaw_8000, faster, cheaper than multilingual_v2
 // FIX: timeout increased 3s → 5s (was too aggressive, caused false fallbacks)
-// FIX: cache key includes format to prevent stale collisions
+// FIX: cache key includes format to prevent stale format collisions
+//
+// NOTE: chunkAudio() is kept for backward compatibility but is no longer called
+//       in the audio delivery path. Audio is now served via HTTP <Play>, not
+//       WebSocket media events, so chunking into 160-byte frames is unnecessary.
 
 const logger = require('../utils/logger');
 
@@ -11,7 +16,8 @@ const audioCache = new Map();
 const MAX_CACHE  = 50;
 const LANG_CODE  = { english: 'en', hindi: 'hi', telugu: 'te' };
 
-// 160 bytes = 20ms of mulaw at 8000Hz — Twilio's expected frame size
+// 160 bytes = 20ms of mulaw at 8000Hz
+// Kept for reference — no longer used in send path
 const CHUNK_SIZE = 160;
 
 async function textToSpeechElevenLabs(text, language) {
@@ -20,7 +26,7 @@ async function textToSpeechElevenLabs(text, language) {
 
   const body = {
     text,
-    // FIX: eleven_turbo_v2_5 fully supports ulaw_8000 output
+    // eleven_turbo_v2_5 fully supports ulaw_8000 output
     // eleven_multilingual_v2 has limited output format support
     model_id: 'eleven_turbo_v2_5',
     voice_settings: {
@@ -29,15 +35,15 @@ async function textToSpeechElevenLabs(text, language) {
       style:             0.25,
       use_speaker_boost: true,
     },
-    // FIX CRITICAL: output_format in BODY — URL query param is silently ignored
-    // ulaw_8000 = mulaw 8kHz mono — exactly what Twilio Media Streams expects
+    // CRITICAL: output_format must be in the BODY — URL query param is silently ignored
+    // ulaw_8000 = mulaw 8kHz mono — exactly what Twilio expects for <Play>
     output_format: 'ulaw_8000',
   };
 
   if (langCode && langCode !== 'en') body.language_code = langCode;
 
   const controller = new AbortController();
-  const timeout    = setTimeout(() => controller.abort(), 5000); // FIX: 3s was too short
+  const timeout    = setTimeout(() => controller.abort(), 5000);
 
   try {
     const response = await fetch(
@@ -47,8 +53,8 @@ async function textToSpeechElevenLabs(text, language) {
         headers: {
           'xi-api-key':   process.env.ELEVENLABS_API_KEY,
           'Content-Type': 'application/json',
-          // FIX CRITICAL: audio/basic = mulaw MIME type
-          // audio/mpeg = MP3 which Twilio cannot decode on media streams
+          // audio/basic = mulaw MIME type
+          // audio/mpeg = MP3 which Twilio <Play> cannot decode correctly for voice calls
           'Accept': 'audio/basic',
         },
         body:   JSON.stringify(body),
@@ -72,8 +78,7 @@ async function textToSpeechElevenLabs(text, language) {
 }
 
 // Split mulaw buffer into 160-byte (20ms) frames
-// Twilio silently truncates large single-payload messages
-// Without chunking: only first ~0.5s plays, rest is dropped
+// Kept for backward compatibility — no longer used in the audio delivery path
 function chunkAudio(buffer) {
   const chunks = [];
   for (let i = 0; i < buffer.length; i += CHUNK_SIZE) {
@@ -94,7 +99,7 @@ function makeTwilioFallback(text, language) {
 async function textToSpeech(text, language = 'english') {
   if (!text || !text.trim()) return null;
 
-  // FIX: cache key includes format — prevents stale format collisions
+  // Cache key includes format — prevents stale format collisions
   const cacheKey = `ulaw_8000:${language}:${text.substring(0, 120)}`;
   if (audioCache.has(cacheKey)) {
     logger.debug('TTS cache hit', { language });

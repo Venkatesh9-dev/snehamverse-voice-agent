@@ -17,7 +17,7 @@ const rateLimit = require('express-rate-limit');
 
 const callRoutes             = require('./routes/callRoutes');
 const { setupStreamHandler } = require('./handlers/streamHandler');
-const { initSheetsHeaders }  = require('./services/notificationService');
+
 const { connectRedis }       = require('./services/sessionManager');
 const logger = require('./utils/logger');
 
@@ -97,11 +97,7 @@ async function start() {
       logger.info(`   Type     : ${process.env.BUSINESS_TYPE}`);
       logger.info(`   Webhook  : ${process.env.BASE_URL}/call/incoming`);
 
-      try {
-        await initSheetsHeaders();
-      } catch {
-        logger.warn('Google Sheets unavailable — call logging disabled');
-      }
+     
     });
 
   } catch (err) {
