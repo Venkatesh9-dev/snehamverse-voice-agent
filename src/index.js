@@ -1,10 +1,9 @@
 // src/index.js
 // SNEHAMVERSE Voice Agent v2.1 — Production Server
 // FIX CRITICAL: removed verifyClient block — was rejecting Twilio WebSocket connections
-// FIX CRITICAL: removed path from WebSocket.Server — Railway proxy modifies URL before
-//               it reaches the container, causing exact-path matching to fail silently
-//               Path routing is now handled inside setupStreamHandler instead
-// FIX: Redis pre-connected before server accepts calls
+// FIX CRITICAL: switched to noServer:true + manual server.on('upgrade') handling
+//               ws.Server automatic upgrade interception fails silently on Railway's proxy
+//               Manual upgrade handling catches ALL WebSocket requests regardless of proxy behavior
 
 require('dotenv').config();
 require('./utils/checkEnv');
@@ -38,10 +37,17 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── WebSocket for Twilio Media Streams ────────────────────────
-// NO path restriction here — Railway's reverse proxy modifies the URL
-// path before forwarding to the container, breaking ws library's exact
-// path matching. Path routing is handled in setupStreamHandler instead.
-const wss = new WebSocket.Server({ server });
+// noServer: true — we handle the HTTP upgrade event manually below
+// This bypasses ws.Server's automatic interception which Railway's proxy
+// interferes with, causing <Connect><Stream> WebSocket connections to fail silently
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  logger.info('WebSocket upgrade received', { url: request.url });
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
 
 setupStreamHandler(wss);
 
@@ -84,7 +90,7 @@ async function start() {
       logger.warn('Redis not available — continuing without it');
     }
 
-    server.listen(PORT, '0.0.0.0', async () => {
+    server.listen(PORT, '0.0.0.0', () => {
       logger.info(`✅ SNEHAMVERSE Voice Agent v2.1 running on port ${PORT}`);
       logger.info(`   Business : ${process.env.BUSINESS_NAME}`);
       logger.info(`   Type     : ${process.env.BUSINESS_TYPE}`);
