@@ -1,9 +1,9 @@
 // src/index.js
 // SNEHAMVERSE Voice Agent v2.1 — Production Server
 // FIX CRITICAL: removed verifyClient block — was rejecting Twilio WebSocket connections
-//               Railway's proxy strips/modifies user-agent before it reaches the server
-//               so TwilioProxy check always failed in production = WebSocket rejected = silence
-//               Security is handled by X-Twilio-Signature on HTTP webhooks instead
+// FIX CRITICAL: removed path from WebSocket.Server — Railway proxy modifies URL before
+//               it reaches the container, causing exact-path matching to fail silently
+//               Path routing is now handled inside setupStreamHandler instead
 // FIX: Redis pre-connected before server accepts calls
 
 require('dotenv').config();
@@ -17,7 +17,6 @@ const rateLimit = require('express-rate-limit');
 
 const callRoutes             = require('./routes/callRoutes');
 const { setupStreamHandler } = require('./handlers/streamHandler');
-
 const { connectRedis }       = require('./services/sessionManager');
 const logger = require('./utils/logger');
 
@@ -39,16 +38,10 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── WebSocket for Twilio Media Streams ────────────────────────
-// FIX CRITICAL: verifyClient removed entirely
-// It was checking user-agent for 'TwilioProxy' but Railway's load balancer
-// strips/rewrites headers — so the check always failed in production
-// and every Twilio WebSocket connection was rejected with 403 Forbidden
-// Result: agent picks up call but streams no audio = caller hears silence
-// Security: X-Twilio-Signature validation on HTTP webhooks handles auth instead
-const wss = new WebSocket.Server({
-  server,
-  path: '/call/stream',
-});
+// NO path restriction here — Railway's reverse proxy modifies the URL
+// path before forwarding to the container, breaking ws library's exact
+// path matching. Path routing is handled in setupStreamHandler instead.
+const wss = new WebSocket.Server({ server });
 
 setupStreamHandler(wss);
 
@@ -96,8 +89,6 @@ async function start() {
       logger.info(`   Business : ${process.env.BUSINESS_NAME}`);
       logger.info(`   Type     : ${process.env.BUSINESS_TYPE}`);
       logger.info(`   Webhook  : ${process.env.BASE_URL}/call/incoming`);
-
-     
     });
 
   } catch (err) {

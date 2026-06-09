@@ -36,9 +36,8 @@ const IDLE_TIMEOUT_MS  = (parseInt(process.env.IDLE_TIMEOUT_SECONDS) || 30) * 10
 const DEBOUNCE_MS      = 1200;
 const MIN_TRANSCRIPT   = 2;
 const MIN_CONFIDENCE   = 0.55;
-const FRAME_MS         = 20;   // mulaw frame duration — 160 bytes at 8kHz = 20ms
+const FRAME_MS         = 20;
 
-// Bye patterns — triggers polite goodbye + hangup
 const BYE_PATTERNS = [
   'bye', 'goodbye', 'good bye', 'see you', 'thank you bye',
   'thanks bye', "that's all", 'no thank you', 'not interested',
@@ -79,7 +78,17 @@ function sleep(ms) {
 const activeConnections = new Map();
 
 function setupStreamHandler(wss) {
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+
+    // Only handle Twilio Media Stream connections at /call/stream
+    // WebSocket.Server has no path restriction (Railway proxy modifies URLs)
+    // so we filter here instead
+    if (!req.url || !req.url.startsWith('/call/stream')) {
+      logger.warn('Rejected WebSocket on unexpected path', { path: req.url });
+      ws.close(1008, 'Invalid path');
+      return;
+    }
+
     logger.info('New WebSocket connection from Twilio');
 
     let callSid               = null;
@@ -87,7 +96,7 @@ function setupStreamHandler(wss) {
     let dgConnection          = null;
     let isProcessing          = false;
     let isSpeaking            = false;
-    let speakingAbortController = null; // ← NEW: cancels in-progress audio loop
+    let speakingAbortController = null;
     let transcriptBuffer      = '';
     let streamSid             = null;
     let sessionEnded          = false;
@@ -95,9 +104,6 @@ function setupStreamHandler(wss) {
     let idleTimer             = null;
     let maxCallTimer          = null;
 
-    // ── Helper: interrupt any currently-playing agent audio ───
-    // Aborts the frame loop AND sends Twilio 'clear' to flush its buffer.
-    // Called on barge-in so the caller's words are never discarded.
     function interruptSpeaking() {
       if (!isSpeaking) return;
       logger.debug('Barge-in — interrupting agent audio', { callSid });
@@ -106,13 +112,11 @@ function setupStreamHandler(wss) {
         speakingAbortController = null;
       }
       isSpeaking = false;
-      // Flush Twilio's jitter buffer so caller hears silence immediately
       if (ws.readyState === WebSocket.OPEN && streamSid) {
         ws.send(JSON.stringify({ event: 'clear', streamSid }));
       }
     }
 
-    // ── Deepgram ──────────────────────────────────────────────
     function setupDeepgram() {
       try {
         dgConnection = deepgramClient.listen.live({
@@ -132,7 +136,6 @@ function setupStreamHandler(wss) {
         });
 
         dgConnection.on(LiveTranscriptionEvents.SpeechStarted, () => {
-          // Caller started speaking — interrupt agent audio immediately
           if (isSpeaking) interruptSpeaking();
           clearTimeout(silenceTimer);
         });
@@ -171,9 +174,6 @@ function setupStreamHandler(wss) {
           if (!transcript || !transcript.trim()) return;
           if (confidence < MIN_CONFIDENCE) return;
 
-          // ── BARGE-IN ──────────────────────────────────────
-          // Interrupt agent audio if still playing, then fall through
-          // so this transcript is processed normally (not discarded).
           if (isSpeaking) interruptSpeaking();
 
           resetIdleTimer();
@@ -183,7 +183,6 @@ function setupStreamHandler(wss) {
 
           transcriptBuffer = clean;
 
-          // Language detection
           if (detectedLang && callSid) {
             const detectedKey = detectLanguage(detectedLang, clean);
             const session     = await sessionManager.getSession(callSid);
@@ -193,7 +192,6 @@ function setupStreamHandler(wss) {
             }
           }
 
-          // Fallback debounce in case UtteranceEnd doesn't fire
           clearTimeout(silenceTimer);
           silenceTimer = setTimeout(async () => {
             if (isSpeaking) return;
@@ -220,7 +218,6 @@ function setupStreamHandler(wss) {
       }
     }
 
-    // ── Idle Timer ────────────────────────────────────────────
     function resetIdleTimer() {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(async () => {
@@ -239,7 +236,6 @@ function setupStreamHandler(wss) {
       }, IDLE_TIMEOUT_MS);
     }
 
-    // ── Process speech → LLM → TTS → caller ──────────────────
     async function processUserInput(transcript) {
       if (isProcessing || sessionEnded) return;
       isProcessing = true;
@@ -294,25 +290,9 @@ function setupStreamHandler(wss) {
       }
     }
 
-    // ── TTS → paced mulaw frames → WebSocket → caller ─────────
-    //
-    // HOW THIS WORKS:
-    //   1. ElevenLabs returns a mulaw 8kHz mono Buffer
-    //   2. chunkAudio() splits it into 160-byte (20ms) frames
-    //   3. Each frame is base64-encoded and sent as a WebSocket 'media' event
-    //   4. We wait 20ms between frames to match real-time playback speed
-    //   5. Twilio receives frames at the correct rate and plays them to caller
-    //
-    // BARGE-IN CANCELLATION (v2.3):
-    //   - speakingAbortController is created fresh for every speakToUser() call
-    //   - interruptSpeaking() aborts the controller and sends Twilio 'clear'
-    //   - The frame loop checks signal.aborted on every iteration and exits cleanly
-    //   - isSpeaking is reset immediately by interruptSpeaking(), not after the loop
-    //
     async function speakToUser(text, language = 'english') {
       if (!text || !streamSid || sessionEnded) return;
 
-      // Cancel any previous audio that is still streaming
       if (speakingAbortController) {
         speakingAbortController.abort();
       }
@@ -324,7 +304,6 @@ function setupStreamHandler(wss) {
         const result = await textToSpeech(text, language);
         if (!result || signal.aborted) return;
 
-        // ── Twilio <Say> fallback (ElevenLabs failed) ─────────
         if (result.isFallback) {
           logger.info('Twilio <Say> fallback', { callSid });
           try {
@@ -344,7 +323,6 @@ function setupStreamHandler(wss) {
 
         if (ws.readyState !== WebSocket.OPEN) return;
 
-        // ── Pace mulaw frames at 20ms intervals ───────────────
         isSpeaking = true;
         const chunks = chunkAudio(result);
 
@@ -358,10 +336,7 @@ function setupStreamHandler(wss) {
         });
 
         for (const chunk of chunks) {
-          // Exit immediately if barge-in occurred or session ended
           if (signal.aborted || ws.readyState !== WebSocket.OPEN || sessionEnded) {
-            // Flush Twilio buffer (interruptSpeaking already sent 'clear',
-            // but send again defensively if loop exits for other reasons)
             if (!signal.aborted && ws.readyState === WebSocket.OPEN && streamSid) {
               ws.send(JSON.stringify({ event: 'clear', streamSid }));
             }
@@ -375,7 +350,6 @@ function setupStreamHandler(wss) {
           await sleep(FRAME_MS);
         }
 
-        // Only send mark + reset state if we weren't interrupted
         if (!signal.aborted) {
           if (ws.readyState === WebSocket.OPEN && !sessionEnded) {
             ws.send(JSON.stringify({
@@ -388,7 +362,6 @@ function setupStreamHandler(wss) {
           speakingAbortController = null;
           logger.debug('Audio streaming complete', { callSid, frames: chunks.length });
         }
-        // If aborted: isSpeaking was already reset by interruptSpeaking()
 
       } catch (err) {
         if (err.name !== 'AbortError') {
@@ -419,7 +392,6 @@ function setupStreamHandler(wss) {
       clearTimeout(idleTimer);
       clearTimeout(maxCallTimer);
 
-      // Cancel any in-progress audio
       if (speakingAbortController) {
         speakingAbortController.abort();
         speakingAbortController = null;
@@ -461,7 +433,6 @@ function setupStreamHandler(wss) {
       }
     }
 
-    // ── Twilio WebSocket message router ───────────────────────
     ws.on('message', async (rawMsg) => {
       try {
         const msg = JSON.parse(rawMsg);
@@ -502,7 +473,6 @@ function setupStreamHandler(wss) {
               setTimeout(() => handleCallEnd('max_duration'), 3000);
             }, MAX_CALL_SECONDS * 1000);
 
-            // Greet after 1200ms — let stream stabilise
             setTimeout(async () => {
               try {
                 const session    = await sessionManager.getSession(callSid);
@@ -518,7 +488,6 @@ function setupStreamHandler(wss) {
             break;
 
           case 'media':
-            // Only forward inbound (caller) audio to Deepgram
             if (msg.media?.track === 'outbound') return;
             if (dgConnection && msg.media?.payload) {
               try {
@@ -530,7 +499,6 @@ function setupStreamHandler(wss) {
             break;
 
           case 'mark':
-            // Twilio confirms our audio finished playing
             if (msg.mark?.name === 'playback_complete') {
               isSpeaking = false;
             }
