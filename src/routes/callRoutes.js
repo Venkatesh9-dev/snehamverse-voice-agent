@@ -3,7 +3,8 @@
 //
 // Audio delivery: bidirectional WebSocket media events (both_tracks)
 // Uses <Connect><Stream> — required for sending audio back to caller
-// <Start><Stream> is receive-only (monitoring) — DO NOT use for voice agents
+// WebSocket URL built from BASE_URL — req.headers.host is unreliable
+// behind Railway's reverse proxy
 
 const express = require('express');
 const twilio  = require('twilio');
@@ -39,10 +40,11 @@ router.post('/incoming', validateTwilio, (req, res) => {
 
   logger.info('Incoming call received', { callSid });
 
+  const wsUrl   = `${process.env.BASE_URL.replace('https://', 'wss://')}/call/stream`;
   const twiml   = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
   const stream  = connect.stream({
-    url:   `wss://${req.headers.host}/call/stream`,
+    url:   wsUrl,
     track: 'both_tracks',
   });
 
@@ -50,7 +52,7 @@ router.post('/incoming', validateTwilio, (req, res) => {
   stream.parameter({ name: 'callSid',     value: callSid });
 
   res.type('text/xml').send(twiml.toString());
-  logger.info('TwiML sent, media stream opening', { callSid });
+  logger.info('TwiML sent, media stream opening', { callSid, wsUrl });
 });
 
 // ── POST /call/status ─────────────────────────────────────────
